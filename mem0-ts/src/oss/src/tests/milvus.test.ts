@@ -2,6 +2,15 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { Milvus } from "../vector_stores/milvus";
 
+// The provider imports `loadPeer` statically, so the jest.mock factory runs
+// during module evaluation — before top-level consts execute. The factory
+// therefore only installs a pass-through handle; the jest.fn it delegates to
+// is assigned in beforeAll, once the const below is initialized.
+const loadPeerHandle: { fn?: (...args: any[]) => Promise<any> } = {};
+jest.mock("../utils/load_peer", () => ({
+  loadPeer: (...args: any[]) => loadPeerHandle.fn!(...args),
+}));
+
 /**
  * In-memory fake of the subset of the `@zilliz/milvus2-sdk-node` MilvusClient
  * API that the Milvus vector store uses. Lets us exercise the provider's
@@ -143,6 +152,9 @@ class FakeMilvusClient {
 beforeAll(() => {
   jest.spyOn(console, "error").mockImplementation(() => {});
   jest.spyOn(console, "warn").mockImplementation(() => {});
+  loadPeerHandle.fn = jest.fn(async (_pkg: string, _label: string) => {
+    throw new Error("loadPeer should be mocked per test");
+  });
 });
 afterAll(() => {
   (console.error as jest.Mock).mockRestore?.();
@@ -551,6 +563,76 @@ describe("Milvus vector store (TS OSS SDK)", () => {
     await store.insert([[1, 2, 3]], ["a"], [{ data: "d" }]);
     const insertCall = client.calls.find((c) => c.method === "insert")!;
     expect(insertCall.args.data[0].text).toBe("d");
+  });
+
+  describe("when no client is injected (lazy SDK load)", () => {
+    // Counts MilvusClient instantiations to expose a check-then-set race:
+    // two concurrent calls must never build two clients.
+    class CountingFakeClient extends FakeMilvusClient {
+      static instances = 0;
+      constructor(opts?: { existing?: string[]; bm25?: string[] }) {
+        super(opts);
+        CountingFakeClient.instances++;
+      }
+    }
+
+    beforeEach(() => {
+      CountingFakeClient.instances = 0;
+      (loadPeerHandle.fn as jest.Mock).mockReset();
+      (loadPeerHandle.fn as jest.Mock).mockImplementation(
+        async () =>
+          ({
+            MilvusClient: CountingFakeClient,
+            DataType: {
+              VarChar: 21,
+              FloatVector: 201,
+              JSON: 23,
+              SparseFloatVector: 104,
+            },
+            FunctionType: { BM25: 1 },
+          }) as any,
+      );
+    });
+
+    it("resolves the SDK and builds the client exactly once under concurrent calls", async () => {
+      const store = new Milvus({
+        url: "http://localhost:19530",
+        embeddingModelDims: 3,
+      });
+      await Promise.all([
+        store.initialize(),
+        store.insert([[0.1, 0.2, 0.3]], ["a"], [{ data: "x" }]),
+        store.search([0.1, 0.2, 0.3]),
+      ]);
+
+      expect(loadPeerHandle.fn).toHaveBeenCalledTimes(1);
+      expect(CountingFakeClient.instances).toBe(1);
+      // The awaited promise produced a usable client, not just a cached load.
+      const got = await store.get("a");
+      expect(got!.payload).toEqual({ data: "x" });
+    });
+
+    it("surfaces the friendly install error when the SDK cannot be loaded", async () => {
+      (loadPeerHandle.fn as jest.Mock).mockRejectedValue(
+        new Error(
+          "The '@zilliz/milvus2-sdk-node' package is required to use the Milvus vector store. " +
+            "Install it with: npm install @zilliz/milvus2-sdk-node",
+        ),
+      );
+      const store = new Milvus({
+        url: "http://localhost:19530",
+        embeddingModelDims: 3,
+      });
+      // The cached rejection replays identically on every awaited call instead
+      // of re-running the load.
+      await expect(store.search([0.1, 0.2, 0.3])).rejects.toThrow(
+        /npm install @zilliz\/milvus2-sdk-node/,
+      );
+      await expect(store.insert([[0.1, 0.2, 0.3]], ["a"], [])).rejects.toThrow(
+        /npm install @zilliz\/milvus2-sdk-node/,
+      );
+      expect(loadPeerHandle.fn).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("never loads the SDK via a synchronous require()", () => {
