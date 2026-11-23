@@ -173,7 +173,19 @@ class Completions:
             }.items()
             if value is not None
         }
-        merged_filters = {**(filters or {}), **entity_filters}
+        if isinstance(self.mem0_client, mem0.client.main.MemoryClient):
+            # The hosted API ANDs a flat filters dict, but memories written
+            # through the default extraction path carry only one non-null entity
+            # field, so ANDing two entity ids would match nothing — multiple ids
+            # must be OR'd instead (docs/platform/features/entity-scoped-memory.mdx).
+            # A single id stays flat, the API's documented shape.
+            clauses = [{key: value} for key, value in entity_filters.items()]
+            scope = {"OR": clauses} if len(clauses) > 1 else (clauses[0] if clauses else {})
+            merged_filters = {**(filters or {}), **scope}
+        else:
+            # OSS Memory.search takes a flat filters dict whose entity ids AND
+            # together — consistent with how add() populates them.
+            merged_filters = {**(filters or {}), **entity_filters}
         return self.mem0_client.search(
             query="\n".join(message_input),
             filters=merged_filters,

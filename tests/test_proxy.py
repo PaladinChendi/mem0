@@ -18,6 +18,13 @@ def mock_memory_client():
 
 
 @pytest.fixture
+def mock_memory():
+    mock_client = Mock(spec=Memory)
+    mock_client.user_email = None
+    return mock_client
+
+
+@pytest.fixture
 def mock_openai_embedding_client():
     with patch("mem0.embeddings.openai.OpenAI") as mock_openai:
         mock_client = Mock()
@@ -168,6 +175,55 @@ def test_completions_search_filters_omit_unset_entity_ids(mock_memory_client, mo
     search_kwargs = mock_memory_client.search.call_args.kwargs
     assert "user_id" not in search_kwargs
     assert search_kwargs["filters"] == {"user_id": "test_user"}
+
+
+def test_completions_search_platform_client_ors_multiple_entity_ids(mock_memory_client, mock_litellm):
+    """The hosted API ANDs a flat filters dict, but memories written through the
+    default extraction path carry only one non-null entity field, so ANDing two
+    entity ids matches nothing — multiple ids must be OR'd
+    (docs/platform/features/entity-scoped-memory.mdx). A single id stays flat,
+    the API's documented shape.
+    """
+    completions = Completions(mock_memory_client)
+    mock_memory_client.search.return_value = {"results": []}
+    mock_litellm.supports_function_calling.return_value = True
+
+    with patch("mem0.proxy.main.threading.Thread") as mock_thread:
+        mock_thread.side_effect = lambda target, daemon: Mock(start=target)
+        completions.create(
+            model="gpt-4.1-nano-2025-04-14",
+            messages=[{"role": "user", "content": "Hello"}],
+            user_id="test_user",
+            agent_id="test_agent",
+        )
+
+    assert mock_memory_client.search.call_args.kwargs["filters"] == {
+        "OR": [{"user_id": "test_user"}, {"agent_id": "test_agent"}]
+    }
+
+
+def test_completions_search_oss_memory_keeps_flat_entity_filters(mock_memory, mock_litellm):
+    """OSS Memory.search takes a flat filters dict whose entity ids AND together
+    — consistent with how add() populates them — so the proxy must not wrap them
+    in the hosted API's OR shape.
+    """
+    completions = Completions(mock_memory)
+    mock_memory.search.return_value = {"results": []}
+    mock_litellm.supports_function_calling.return_value = True
+
+    with patch("mem0.proxy.main.threading.Thread") as mock_thread:
+        mock_thread.side_effect = lambda target, daemon: Mock(start=target)
+        completions.create(
+            model="gpt-4.1-nano-2025-04-14",
+            messages=[{"role": "user", "content": "Hello"}],
+            user_id="test_user",
+            agent_id="test_agent",
+        )
+
+    assert mock_memory.search.call_args.kwargs["filters"] == {
+        "user_id": "test_user",
+        "agent_id": "test_agent",
+    }
 
 
 def test_completions_format_query_reads_results_key_for_memory_client(mock_memory_client, mock_litellm):
